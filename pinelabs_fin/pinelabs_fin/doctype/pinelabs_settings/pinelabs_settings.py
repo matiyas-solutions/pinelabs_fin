@@ -341,7 +341,8 @@ def _extract_routing_contexts(source_doc):
 	if company:
 		contexts.append(("Company", company))
 
-	pos_profile = _get("pos_profile")
+	# POS Awesome payments reference the POS Profile itself.
+	pos_profile = source_doc.name if _get("doctype") == "POS Profile" else _get("pos_profile")
 	if pos_profile:
 		contexts.append(("POS Profile", pos_profile))
 
