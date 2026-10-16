@@ -51,11 +51,35 @@ PE_NATIVE_DOCTYPES = ("Sales Invoice", "POS Invoice", "Payment Request")
 # integration — they are part of the install contract.
 # ──────────────────────────────────────────────────────────────────────────
 
+# Pine Labs Cloud allowed_payment_mode integers.
+# UPI has two codes: 10 = UPI Sale (UPI QR on terminal), 11 = UPI Bharat QR.
+# Which one is sent is configurable via Pinelabs Settings → UPI Payment Mode Code.
+CARD_TERMINAL_CODE = 1
+UPI_TERMINAL_CODES = (10, 11)
+DEFAULT_UPI_TERMINAL_CODE = 10
+
 # Terminal modes — name → Pine Labs Cloud allowed_payment_mode integer.
+# The UPI value here is only the default; use get_terminal_code() so the
+# Settings override is honoured.
 PINELABS_TERMINAL_MODES = {
-	"PineLabs - Card": 1,
-	"PineLabs - UPI": 11,
+	"PineLabs - Card": CARD_TERMINAL_CODE,
+	"PineLabs - UPI": DEFAULT_UPI_TERMINAL_CODE,
 }
+
+
+def get_upi_terminal_code():
+	"""AllowedPaymentMode to send for UPI, from Pinelabs Settings (default 10)."""
+	code = cint(frappe.db.get_single_value("Pinelabs Settings", "upi_payment_mode_code"))
+	return code if code in UPI_TERMINAL_CODES else DEFAULT_UPI_TERMINAL_CODE
+
+
+def get_terminal_code(mode_of_payment):
+	"""Pine Labs AllowedPaymentMode for a terminal Mode of Payment, or None."""
+	if mode_of_payment not in PINELABS_TERMINAL_MODES:
+		return None
+	if mode_of_payment == "PineLabs - UPI":
+		return get_upi_terminal_code()
+	return PINELABS_TERMINAL_MODES[mode_of_payment]
 
 # Terminal method string (CARD / UPI on the txn) → mode name.
 PINELABS_METHOD_TO_MODE = {
@@ -127,6 +151,7 @@ def create_transaction(
 	order_id=None,
 	request_payload=None,
 	create_payment_entry=None,
+	client_request_id=None,
 ):
 	"""Insert a new Pinelabs Transaction in INITIATED state.
 
@@ -161,6 +186,8 @@ def create_transaction(
 	override = normalize_create_payment_entry(create_payment_entry)
 	if override:
 		doc.create_payment_entry_override = override
+	if client_request_id:
+		doc.client_request_id = client_request_id
 	if request_payload is not None:
 		doc.request_payload = _to_json_str(request_payload)
 

@@ -53,7 +53,7 @@ Print/log output from the payment flows goes to the **`bench start` terminal**, 
 ERPNext doc (Sales Invoice, POS Invoice, …)
         │  "Pay on Machine" / "Send Payment Link" button
         ▼
-public/js/pinelabs_buttons.js       ← the ONLY JS loaded (hooks.app_include_js)
+public/js/pinelabs_buttons.js       ← loaded on every desk page (hooks.app_include_js)
         │
         ├──────────────────────┬─────────────────────────┐
         ▼                      ▼                         │
@@ -119,7 +119,7 @@ Preserve this ordering when adding a flow. A check that runs after the gateway c
 
 The app seeds exactly three rows and matches them **by name**, with **zero custom fields** on `Mode of Payment` (or on Sales Invoice / POS Invoice / Payment Entry / Customer / Contact — this is deliberate, for marketplace cleanliness):
 
-`PineLabs - Card` (terminal code 1) · `PineLabs - UPI` (terminal code 11) · `PineLabs - Payment Link` (all Plural payments)
+`PineLabs - Card` (terminal code 1) · `PineLabs - UPI` (terminal code 10 = UPI Sale by default, or 11 = UPI Bharat QR — set by Pinelabs Settings → UPI Payment Mode Code; always resolve it via `get_terminal_code()`, never the dict) · `PineLabs - Payment Link` (all Plural payments)
 
 Renaming any of them breaks the integration silently. The names are defined in `api/transaction.py` (`PINELABS_TERMINAL_MODES`, `PINELABS_PLURAL_MODE`) and seeded in `install.py` — keep those two in sync. Seeding runs from `after_install` (fresh installs) *and* the `install_pinelabs_modes` patch (upgrades), because Frappe marks patches as already-run on a fresh install without executing them.
 
@@ -134,6 +134,14 @@ Everything lives on the `Pinelabs Settings` **Single** doctype: `machines` (term
 **Documentation is inconsistent and lags the code.** `README.md` is accurate and current. `guide.md` is a detailed reference that is **partially stale** — it describes 4 Modes of Payment carrying custom fields (there are 3, with none), plus doctypes and patches (`pinelabs_bank`, `seed_pinelabs_banks.py`, …) that don't exist. `GUIDE.md` (capitalized — a *different* file on this case-sensitive filesystem) documents the **deleted** `pos_endpoints` API end to end and should be treated as obsolete. Trust the code and `README.md` over both.
 
 **Child-table fields vanish from `frappe.db.get_list`.** Querying `Pinelabs Payable Doctype` with `get_list` silently returns `undefined` for Link and custom fields. `pinelabs_buttons.js` deliberately calls `frappe.client.get` on the `Pinelabs Settings` Single and iterates `doc.payable_doctypes` instead. Don't "optimize" that back to `get_list` — per-row toggles stop working silently.
+
+## POS Awesome
+
+`public/js/pinelabs_posawesome.js` (also in `app_include_js`) takes terminal payments inside POS Awesome. POS Awesome creates and submits the invoice in one call, so the payment runs **before** the invoice exists: it references the **POS Profile**, uses `create_payment_entry=0` (the payment is a row on the invoice's own payments table), and carries POS Awesome's `posa_client_request_id` in `Pinelabs Transaction.client_request_id`. It hooks in via `window.posawesome_before_submit_payment_hooks`, which needs a small patch in POS Awesome's `Payments.vue` (re-apply after updating POS Awesome).
+
+`api/posawesome.py`: the till asks `get_request_payments` before charging (no double charge on retry/refresh), `link_on_invoice_submit` (Sales/POS Invoice `on_submit`) re-points the transaction at the invoice, and `alert_unlinked_pos_payments` (every 15 min) logs payments that never got an invoice. `access.assert_can_pay` lets cashiers listed on the POS Profile pay without write on the profile.
+
+The two JS files are plain `/assets/...` paths, cached by browsers for 12h — bump the `?v=` in `hooks.app_include_js` whenever they change.
 
 ## Limitations
 

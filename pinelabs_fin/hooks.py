@@ -26,7 +26,12 @@ required_apps = ["erpnext"]
 
 # include js, css files in header of desk.html
 # app_include_css = "/assets/pinelabs_fin/css/pinelabs_fin.css"
-app_include_js = ["/assets/pinelabs_fin/js/pinelabs_buttons.js"]
+app_include_js = [
+	# Plain /assets files are cached by browsers for 12h — bump ?v= whenever
+	# these files change so cashiers' browsers fetch the new version.
+	"/assets/pinelabs_fin/js/pinelabs_buttons.js?v=20261015",
+	"/assets/pinelabs_fin/js/pinelabs_posawesome.js?v=20261015",
+]
 
 # include js, css files in header of web template
 # web_include_css = "/assets/pinelabs_fin/css/pinelabs_fin.css"
@@ -146,6 +151,13 @@ doc_events = {
 	"Payment Entry": {
 		"validate": "pinelabs_fin.api.conflict_guard.refuse_if_pinelabs_active",
 	},
+	# POS Awesome: attach the sale's Pine Labs payments to the invoice.
+	"Sales Invoice": {
+		"on_submit": "pinelabs_fin.api.posawesome.link_on_invoice_submit",
+	},
+	"POS Invoice": {
+		"on_submit": "pinelabs_fin.api.posawesome.link_on_invoice_submit",
+	},
 }
 
 # Scheduled Tasks
@@ -161,6 +173,10 @@ scheduler_events = {
 		"* * * * *": [
 			"pinelabs_fin.api.terminal.reconcile_pending_terminal_payments",
 			"pinelabs_fin.api.plural.reconcile_pending_plural_payments",
+		],
+		# POS Awesome: flag payments that never got an invoice.
+		"*/15 * * * *": [
+			"pinelabs_fin.api.posawesome.alert_unlinked_pos_payments",
 		],
 	},
 }
