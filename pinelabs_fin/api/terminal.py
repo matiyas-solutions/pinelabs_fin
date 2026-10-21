@@ -122,8 +122,30 @@ def initiate_terminal_payment(
 		reference_doctype, reference_name, source_doc=source_doc,
 	)
 	if not machine:
+		if cint(frappe.db.get_single_value("Pinelabs Settings", "only_mapped_machines")):
+			frappe.throw(
+				_("No Pine Labs machine is mapped for {0} {1}. Add a Machine Mapping row for it in Pinelabs Settings, or untick 'Only Allow Mapped Machines'.").format(
+					reference_doctype, reference_name
+				),
+				title=_("No Machine Mapped"),
+			)
 		frappe.throw(
 			_("No Pinelabs machine resolves for this transaction. Configure machine mappings in Pinelabs Machine Mapping, or mark one machine as Is Default in Pinelabs Settings."),
+		)
+
+	# One open transaction per terminal (Pine Labs rule): refuse while the
+	# machine still has an INITIATED/PENDING payment for any other document.
+	busy = txn_service.get_active_for_machine(machine.machine_name, machine_row=machine.name)
+	if busy:
+		frappe.throw(
+			_("Terminal {0} is busy with {1} ({2} for {3} {4}). Complete or cancel that payment first. If it isn't showing on the device, use Payment App → All Modes → Cloud Based Txn → Get Open Txn.").format(
+				machine.machine_name,
+				busy.name,
+				frappe.format(busy.amount, {"fieldtype": "Currency"}),
+				busy.reference_doctype,
+				busy.reference_name,
+			),
+			title=_("Terminal Busy"),
 		)
 
 	terminal_method = _terminal_method_label(mode_doc)

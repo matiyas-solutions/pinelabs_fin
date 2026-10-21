@@ -266,7 +266,8 @@ def resolve_machine_for_context(
 	  for rows whose ``(mapping_type, reference_name)`` matches a context
 	  extracted from the source document and current session, ordered
 	  alphabetically by machine name; falls back to
-	  ``get_default_machine_config()`` on no match.
+	  ``get_default_machine_config()`` on no match — unless
+	  ``only_mapped_machines`` is ticked, then returns ``None``.
 
 	Returns ``None`` if neither path resolves a machine — caller should error
 	with the standard "no machine configured" message.
@@ -306,6 +307,11 @@ def resolve_machine_for_context(
 			for machine in (settings.machines or []):
 				if machine.machine_name == machine_name and cint(machine.enabled):
 					return machine
+
+	# Strict mapping: no matching (enabled) mapping → no machine, so the
+	# caller refuses before Pine Labs is contacted.
+	if cint(settings.get("only_mapped_machines")):
+		return None
 
 	return get_default_machine_config()
 

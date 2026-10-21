@@ -418,6 +418,10 @@ frappe.pinelabs.register_dialog_extension = function (ext) {
 							<div class="text-muted" style="font-size: 0.85em;">${__("Transaction")}: ${frappe.utils.escape_html(transaction_name)}</div>
 							<div style="margin: 16px 0;"><i class="fa fa-spinner fa-spin fa-2x"></i></div>
 							<div id="pinelabs-modal-status" class="text-muted">${__("Waiting for customer to complete payment...")}</div>
+							<div class="text-muted" style="font-size: 0.8em; margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--border-color, #eee);">
+								${__("Not showing on the terminal? On the device open")}<br>
+								<b>${__("Payment App → All Modes → Cloud Based Txn → Get Open Txn")}</b>
+							</div>
 						</div>
 					`,
 				},

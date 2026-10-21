@@ -29,8 +29,8 @@ required_apps = ["erpnext"]
 app_include_js = [
 	# Plain /assets files are cached by browsers for 12h — bump ?v= whenever
 	# these files change so cashiers' browsers fetch the new version.
-	"/assets/pinelabs_fin/js/pinelabs_buttons.js?v=20261015",
-	"/assets/pinelabs_fin/js/pinelabs_posawesome.js?v=20261015",
+	"/assets/pinelabs_fin/js/pinelabs_buttons.js?v=20261021",
+	"/assets/pinelabs_fin/js/pinelabs_posawesome.js?v=20261021",
 ]
 
 # include js, css files in header of web template

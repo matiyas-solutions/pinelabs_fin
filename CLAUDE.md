@@ -112,6 +112,7 @@ Both `initiate_*` entry points run pre-flight checks **before** contacting Pine 
 
 - `validate_finalization_ready()` — refuses a doctype whose finalization path is misconfigured.
 - `assert_mode_has_account_mapped()` — the chosen Mode of Payment must have a default account for the source doc's company (skipped when no PE will be posted), and for custom doctypes a Customer party must resolve.
+- `get_active_for_machine()` (Terminal) — Pine Labs allows **one open transaction per terminal**: a new payment is refused while the machine has any INITIATED/PENDING transaction, from any document. The machine's config row is locked first so concurrent initiates serialize.
 
 Preserve this ordering when adding a flow. A check that runs after the gateway call is worthless.
 

@@ -241,6 +241,35 @@ def get_active_for_doc(reference_doctype, reference_name, for_update=False):
 	)
 
 
+def get_active_for_machine(machine_name, machine_row=None):
+	"""Return the open (INITIATED/PENDING) Terminal transaction on a machine, or None.
+
+	Pine Labs terminals take one transaction at a time: in production the
+	previous one must be completed or cancelled before a new upload. This is
+	checked across ALL source docs (any invoice / POS sale on that machine).
+
+	``machine_row`` (the Pinelabs Machine Config child row name) is row-locked
+	first so two concurrent initiates on the same machine serialize — same
+	lock-then-fresh-read pattern as lock_source_for_initiate + get_active_for_doc.
+	"""
+	if not machine_name:
+		return None
+	if machine_row:
+		frappe.db.get_value("Pinelabs Machine Config", machine_row, "name", for_update=True)
+	return frappe.db.get_value(
+		"Pinelabs Transaction",
+		{
+			"flow_type": "Terminal",
+			"machine": machine_name,
+			"status": ["in", ACTIVE_STATUSES],
+		},
+		["name", "amount", "reference_doctype", "reference_name", "creation"],
+		order_by="creation desc",
+		for_update=True,
+		as_dict=True,
+	)
+
+
 # ──────────────────────────────────────────────────────────────────────────
 # Status transitions
 # ──────────────────────────────────────────────────────────────────────────

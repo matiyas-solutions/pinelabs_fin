@@ -55,14 +55,32 @@
 		};
 	}
 
+	// First message from a frappe.throw response (HTTP 417), as plain text.
+	function server_error_message(r) {
+		try {
+			const messages = JSON.parse((r && r._server_messages) || "[]");
+			const first = messages.length ? JSON.parse(messages[0]) : null;
+			const text = first && (first.message || first);
+			if (text) return frappe.utils.strip_html(String(text));
+		} catch (e) {
+			/* fall through */
+		}
+		return (r && r.exception) || __("Pine Labs payment could not be started");
+	}
+
+	// Calls initiate directly (not start_terminal_payment) so a server-side
+	// refusal (permission, no mapped machine, …) rejects the promise instead
+	// of leaving POS Awesome's submit waiting forever.
 	function take_terminal_payment({ pos_profile, mode_of_payment, amount, client_request_id }) {
 		return new Promise((resolve, reject) => {
-			if (!frappe.pinelabs || !frappe.pinelabs.start_terminal_payment) {
+			if (!frappe.pinelabs || !frappe.pinelabs.open_terminal_modal) {
 				reject(new Error(__("Pine Labs is not loaded. Reload the page and try again.")));
 				return;
 			}
-			frappe.pinelabs.start_terminal_payment(
-				{
+			const callbacks = modal_callbacks(mode_of_payment, resolve, reject);
+			frappe.call({
+				method: "pinelabs_fin.api.terminal.initiate_terminal_payment",
+				args: {
 					reference_doctype: "POS Profile",
 					reference_name: pos_profile,
 					mode_of_payment,
@@ -70,8 +88,20 @@
 					create_payment_entry: 0,
 					client_request_id,
 				},
-				modal_callbacks(mode_of_payment, resolve, reject),
-			);
+				freeze: true,
+				freeze_message: __("Sending request to terminal..."),
+				callback(r) {
+					const msg = (r && r.message) || {};
+					if (!msg.success || !msg.transaction_name) {
+						callbacks.on_error(msg.message || msg.error);
+						return;
+					}
+					frappe.pinelabs.open_terminal_modal(msg.transaction_name, callbacks);
+				},
+				error(r) {
+					callbacks.on_error(server_error_message(r));
+				},
+			});
 		});
 	}
 
@@ -95,6 +125,7 @@
 	}
 
 	async function before_submit({ invoice, pos_profile }) {
+		if (frappe.pinelabs) frappe.pinelabs.modal_z_index = POS_MODAL_Z_INDEX;
 		const rows = (invoice.payments || []).filter(
 			(p) => TERMINAL_MODES.includes(p.mode_of_payment) && flt2(p.amount) !== 0,
 		);
@@ -280,6 +311,16 @@
 		window.posawesome_before_submit_payment_hooks.push(before_submit);
 		window.__pinelabs_posa_hook_registered = true;
 	}
+
+	// While on the POS page, lift EVERY Bootstrap dialog (Frappe error
+	// messages, our terminal dialog, prompts) above POS Awesome's Vuetify
+	// screens — each together with its own backdrop only.
+	$(document).on("shown.bs.modal", ".modal", function () {
+		if (!on_pos_page()) return;
+		$(this).css("z-index", POS_MODAL_Z_INDEX + 1);
+		const bs_modal = $(this).data("bs.modal");
+		if (bs_modal && bs_modal._backdrop) $(bs_modal._backdrop).css("z-index", POS_MODAL_Z_INDEX);
+	});
 
 	function on_route_change() {
 		if (frappe.pinelabs) {
