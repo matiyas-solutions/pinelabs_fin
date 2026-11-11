@@ -39,12 +39,17 @@ import frappe
 from frappe import _
 from frappe.utils import cint, flt, get_datetime, time_diff_in_seconds
 
+from pinelabs_fin.api.pinelabs_client import _debug_print
+
 # Grace added to the gateway's own auto-cancel timeout to get the app-side
 # age-out (see _auto_cancel_minutes). The terminal cancels at its timeout and
 # the next poll observes that; the foreground dialog polls every ~3s and the
 # cron every 60s, so two minutes is ample headroom for the app to see a
 # gateway-side cancellation before deciding to force one itself.
 AGE_OUT_GRACE_MINUTES = 2
+
+# Validated with Pine Labs: no terminal transaction below ₹1.
+MIN_TERMINAL_AMOUNT = 1
 
 
 @frappe.whitelist()
@@ -54,6 +59,7 @@ def initiate_terminal_payment(
 	mode_of_payment: str,
 	amount: float | None = None,
 	create_payment_entry: int | None = None,
+	client_request_id: str | None = None,
 ) -> dict:
 	"""Start a terminal payment.
 
@@ -102,6 +108,14 @@ def initiate_terminal_payment(
 	resolved_amount = flt(amount) if amount else _amount_for(source_doc)
 	if resolved_amount <= 0:
 		frappe.throw(_("No outstanding amount on {0} {1}.").format(reference_doctype, reference_name))
+	if resolved_amount < MIN_TERMINAL_AMOUNT:
+		# Validated with Pine Labs: the billing app never initiates below ₹1.
+		frappe.throw(
+			_("Pine Labs terminal payments must be at least ₹{0}. Amount: ₹{1}.").format(
+				MIN_TERMINAL_AMOUNT, resolved_amount
+			),
+			title=_("Amount Too Low"),
+		)
 
 	# Serialize concurrent initiates on this source doc, then refuse a second
 	# attempt while one is in flight. The lock closes the check-then-act window
@@ -119,15 +133,37 @@ def initiate_terminal_payment(
 		reference_doctype, reference_name, source_doc=source_doc,
 	)
 	if not machine:
+		if cint(frappe.db.get_single_value("Pinelabs Settings", "only_mapped_machines")):
+			frappe.throw(
+				_("No Pine Labs machine is mapped for {0} {1}. Add a Machine Mapping row for it in Pinelabs Settings, or untick 'Only Allow Mapped Machines'.").format(
+					reference_doctype, reference_name
+				),
+				title=_("No Machine Mapped"),
+			)
 		frappe.throw(
 			_("No Pinelabs machine resolves for this transaction. Configure machine mappings in Pinelabs Machine Mapping, or mark one machine as Is Default in Pinelabs Settings."),
 		)
 
+	# One open transaction per terminal (Pine Labs rule): refuse while the
+	# machine still has an INITIATED/PENDING payment for any other document.
+	busy = txn_service.get_active_for_machine(machine.machine_name, machine_row=machine.name)
+	if busy:
+		frappe.throw(
+			_("Terminal {0} is busy with {1} ({2} for {3} {4}). Complete or cancel that payment first. If it isn't showing on the device, use Payment App → All Modes → Cloud Based Txn → Get Open Txn.").format(
+				machine.machine_name,
+				busy.name,
+				frappe.format(busy.amount, {"fieldtype": "Currency"}),
+				busy.reference_doctype,
+				busy.reference_name,
+			),
+			title=_("Terminal Busy"),
+		)
+
 	terminal_method = _terminal_method_label(mode_doc)
 	terminal_code = cint(mode_doc.get("pinelabs_terminal_code"))
-	if terminal_code not in (1, 11):
+	if terminal_code not in (1, 10, 11):
 		frappe.throw(
-			_("Mode of Payment {0} has invalid terminal code {1}; expected 1 (Card) or 11 (UPI).").format(
+			_("Mode of Payment {0} has invalid terminal code {1}; expected 1 (Card), 10 (UPI Sale) or 11 (UPI Bharat QR).").format(
 				mode_of_payment, terminal_code
 			),
 		)
@@ -140,8 +176,15 @@ def initiate_terminal_payment(
 		payment_method=terminal_method,
 		machine=machine.machine_name,
 		create_payment_entry=create_payment_entry,
+		client_request_id=client_request_id,
 	)
 
+	_debug_print(
+		"INITIATE",
+		f"{txn.name} | {reference_doctype} {reference_name} | mode={mode_of_payment} "
+		f"method={terminal_method} AllowedPaymentMode={terminal_code} amount={resolved_amount} "
+		f"machine={machine.machine_name}",
+	)
 	client = get_pinelabs_client(machine_name=machine.machine_name)
 	response = client.upload_billed_raw(
 		transaction_ref=txn.name,
@@ -151,6 +194,11 @@ def initiate_terminal_payment(
 	response_data = response.get("data") or {}
 	response_code = response_data.get("ResponseCode")
 	plutus_ref = response_data.get("PlutusTransactionReferenceID")
+	_debug_print(
+		"INITIATE RESULT",
+		f"{txn.name} | success={response.get('success')} ResponseCode={response_code} "
+		f"Message={response_data.get('ResponseMessage') or response.get('error')} PlutusRef={plutus_ref}",
+	)
 	plutus_ref_str = str(plutus_ref) if plutus_ref else None
 	# Surfaced by the client so we can persist exactly what the app sent
 	# alongside what Pine Labs returned. Same shape Plural already stores
@@ -164,13 +212,18 @@ def initiate_terminal_payment(
 		# Capture the return value: mark_* rebind their local `transaction`
 		# via _lock_and_reload, so our outer `txn` would otherwise stay at
 		# the pre-transition status and _shape would return stale data.
+		error = response.get("error") or _("Pine Labs API call failed")
+		if not response.get("status_code"):
+			# Timeout / connection drop: Pine Labs may still have received the
+			# upload, and we have no PlutusTransactionReferenceID to cancel it.
+			error = _("{0}. The request may still have reached the terminal — check the device and cancel the payment there before retrying.").format(error)
 		txn = txn_service.mark_failed(
 			txn,
-			error_message=response.get("error") or _("Pine Labs API call failed"),
+			error_message=error,
 			response_payload=response_data or response,
 			request_payload=request_payload,
 		)
-		return _shape(success=False, txn=txn, response_code=response_code, message=response.get("error"))
+		return _shape(success=False, txn=txn, response_code=response_code, message=error)
 
 	if response_code in (0, "0"):
 		# Pine Labs accepted the request but didn't return a
@@ -302,6 +355,12 @@ def check_terminal_status(transaction_name: str, create_payment_entry: int | Non
 	response = client.get_status_raw(txn.payment_id)
 	response_data = response.get("data") or {}
 	response_code = response_data.get("ResponseCode")
+	_debug_print(
+		"STATUS",
+		f"{txn.name} | PlutusRef={txn.payment_id} age={_txn_age_minutes(txn):.1f}min "
+		f"success={response.get('success')} ResponseCode={response_code} "
+		f"Message={response_data.get('ResponseMessage') or response.get('error')}",
+	)
 
 	# ResponseCode mapping (GetCloudBasedTxnStatus):
 	#   0    = APPROVED                              → SUCCESS
@@ -440,10 +499,17 @@ def retry_failed_terminal_payment(transaction_name: str) -> dict:
 				transaction_name, txn.payment_method or "—",
 			),
 		)
+	# Carry over what the original caller decided. POS payments reference a
+	# POS Profile (no outstanding to derive an amount from), so reuse the
+	# original amount there.
+	override = (txn.create_payment_entry_override or "").strip()
 	return initiate_terminal_payment(
 		reference_doctype=txn.reference_doctype,
 		reference_name=txn.reference_name,
 		mode_of_payment=mode_of_payment,
+		amount=txn.amount if txn.reference_doctype == "POS Profile" else None,
+		create_payment_entry={"Yes": 1, "No": 0}.get(override),
+		client_request_id=txn.get("client_request_id"),
 	)
 
 
@@ -476,6 +542,11 @@ def cancel_terminal_payment(transaction_name: str, reason: str | None = None) ->
 		response_data = response.get("data") or {}
 		server_message = response_data.get("ResponseMessage")
 		cancel_response_code = response_data.get("ResponseCode")
+		_debug_print(
+			"CANCEL",
+			f"{txn.name} | PlutusRef={txn.payment_id} ResponseCode={cancel_response_code} "
+			f"Message={server_message or response.get('error')}",
+		)
 
 	# If Pine Labs rejected the cancel (e.g. "transaction already processed"),
 	# the customer may have actually paid in the race window between user click
@@ -726,14 +797,14 @@ def _load_pinelabs_mode(mode_of_payment, expected_flows):
 	flow-type check; this function only ever runs against the Terminal
 	dialog, so the only valid input is ``("Terminal", "Both")``.
 	"""
-	from pinelabs_fin.api.transaction import PINELABS_TERMINAL_MODES
+	from pinelabs_fin.api.transaction import PINELABS_TERMINAL_MODES, get_terminal_code
 
 	if not mode_of_payment:
 		frappe.throw(_("Mode of Payment is required."))
 	if not frappe.db.exists("Mode of Payment", mode_of_payment):
 		frappe.throw(_("Mode of Payment {0} does not exist.").format(mode_of_payment))
 
-	terminal_code = PINELABS_TERMINAL_MODES.get(mode_of_payment)
+	terminal_code = get_terminal_code(mode_of_payment)
 	if terminal_code is None:
 		frappe.throw(
 			_(
@@ -747,7 +818,7 @@ def _load_pinelabs_mode(mode_of_payment, expected_flows):
 def _terminal_method_label(mode_doc):
 	"""Map terminal_code → CARD / UPI string used for payment_method."""
 	code = cint(mode_doc.get("pinelabs_terminal_code"))
-	return {1: "CARD", 11: "UPI"}.get(code, "")
+	return {1: "CARD", 10: "UPI", 11: "UPI"}.get(code, "")
 
 
 def _shape(*, success, txn, response_code, message):

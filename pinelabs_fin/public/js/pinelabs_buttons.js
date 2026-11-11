@@ -342,6 +342,22 @@ frappe.pinelabs.register_dialog_extension = function (ext) {
 	// (Namespace `frappe.pinelabs` is set up at the top of the file,
 	// before this IIFE runs, so callers can always assume it exists.)
 
+	// Pages with their own overlays (POS Awesome / Vuetify) set
+	// frappe.pinelabs.modal_z_index so our dialogs sit above them. Raise the
+	// dialog together with ITS OWN backdrop only — touching other dialogs'
+	// backdrops leaves a dark layer over the page that blocks every click.
+	frappe.pinelabs.raise_dialog = function (dialog) {
+		const z = frappe.pinelabs.modal_z_index;
+		if (!z || !dialog || !dialog.$wrapper) return;
+		const apply = () => {
+			dialog.$wrapper.css("z-index", z + 1);
+			const bs_modal = dialog.$wrapper.data("bs.modal");
+			if (bs_modal && bs_modal._backdrop) $(bs_modal._backdrop).css("z-index", z);
+		};
+		apply();
+		dialog.$wrapper.one("shown.bs.modal", apply);
+	};
+
 	frappe.pinelabs.open_terminal_modal = function (transaction_name, options) {
 		LOG("[DEBUG] open_terminal_modal called for", transaction_name, "options=", options);
 		// Already showing a modal for this txn — return the existing one so
@@ -349,14 +365,35 @@ frappe.pinelabs.register_dialog_extension = function (ext) {
 		// the helper-callback open (or vice versa).
 		if (OPEN_TERMINAL_MODALS.has(transaction_name)) {
 			LOG("[DEBUG] open_terminal_modal: registry hit, returning existing modal for", transaction_name);
-			return OPEN_TERMINAL_MODALS.get(transaction_name);
+			const existing = OPEN_TERMINAL_MODALS.get(transaction_name);
+			// The realtime listener can open the modal before the initiate
+			// response reaches the caller — attach the caller's callbacks
+			// to the existing modal so they still fire on settle/cancel.
+			if (options && existing.__pinelabs_add_listeners) {
+				existing.__pinelabs_add_listeners(options);
+			}
+			return existing;
 		}
 		LOG("[DEBUG] open_terminal_modal: registry miss, creating new modal for", transaction_name);
 		options = options || {};
-		const on_settled = typeof options.on_settled === "function" ? options.on_settled : function () {};
-		const on_cancel = typeof options.on_cancel === "function" ? options.on_cancel : function () {};
+		const settled_listeners = [];
+		const cancel_listeners = [];
+		const add_listeners = (opts) => {
+			if (typeof opts.on_settled === "function") settled_listeners.push(opts.on_settled);
+			if (typeof opts.on_cancel === "function") cancel_listeners.push(opts.on_cancel);
+		};
+		add_listeners(options);
+		const call_all = (listeners, args) => listeners.forEach((fn) => {
+			try {
+				fn(...args);
+			} catch (err) {
+				console.error("[Pinelabs] terminal modal listener threw:", err);
+			}
+		});
+		const on_settled = (...args) => call_all(settled_listeners, args);
+		const on_cancel = (...args) => call_all(cancel_listeners, args);
 		const show_alert = options.show_alert !== false;
-		// `poll: false` opts out of the modal's internal 3s setInterval poll.
+		// `poll: false` opts out of the modal's internal 10s status poll.
 		// Useful when a wrapper API (e.g. fin_pos) already runs its own poll
 		// against `check_terminal_status` — without this, both pollers hit
 		// Pine Labs in parallel, doubling the gateway API rate. The modal
@@ -381,6 +418,10 @@ frappe.pinelabs.register_dialog_extension = function (ext) {
 							<div class="text-muted" style="font-size: 0.85em;">${__("Transaction")}: ${frappe.utils.escape_html(transaction_name)}</div>
 							<div style="margin: 16px 0;"><i class="fa fa-spinner fa-spin fa-2x"></i></div>
 							<div id="pinelabs-modal-status" class="text-muted">${__("Waiting for customer to complete payment...")}</div>
+							<div class="text-muted" style="font-size: 0.8em; margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--border-color, #eee);">
+								${__("Not showing on the terminal? On the device open")}<br>
+								<b>${__("Payment App → All Modes → Cloud Based Txn → Get Open Txn")}</b>
+							</div>
 						</div>
 					`,
 				},
@@ -389,13 +430,25 @@ frappe.pinelabs.register_dialog_extension = function (ext) {
 			primary_action() {
 				settled = true;
 				cleanup();
-				cancel_terminal_payment(transaction_name, () => {
+				cancel_terminal_payment(transaction_name, (status) => {
 					modal.hide();
+					// The customer can pay in the gap between the click and
+					// the cancel reaching Pine Labs — the server then marks
+					// the txn SUCCESS. Report that, never "cancelled".
+					if (status === "SUCCESS") {
+						if (show_alert) {
+							frappe.show_alert({ message: __("Customer already paid — payment SUCCESS"), indicator: "green" });
+						}
+						on_settled("SUCCESS", transaction_name);
+						return;
+					}
 					on_cancel(transaction_name);
 				});
 			},
 		});
 		modal.show();
+		frappe.pinelabs.raise_dialog(modal);
+		modal.__pinelabs_add_listeners = add_listeners;
 		OPEN_TERMINAL_MODALS.set(transaction_name, modal);
 
 		// Lock the modal: backdrop click / Esc / X must NOT dismiss it.
@@ -569,13 +622,15 @@ frappe.pinelabs.register_dialog_extension = function (ext) {
 		frappe.realtime.on("pinelabs_txn_update", realtime_handler);
 		LOG(t(), "realtime subscribed to pinelabs_txn_update");
 
-		// Fixed-interval poll using setInterval — fires every 3s regardless
-		// of whether the previous response is back. This matches the old
-		// fast-feedback pattern: chained setTimeout was effectively
-		// (round-trip + 2s) per cycle, which stretched out the perceived
-		// lag once the terminal finished. check_terminal_status is
-		// idempotent, so overlapping in-flight requests are safe.
-		const POLL_INTERVAL_MS = 3000;
+		// Status poll every 10s, one request at a time (as validated with
+		// Pine Labs): the next poll is scheduled only after the previous
+		// response arrives, so slow gateway replies never overlap. The loop
+		// stops as soon as a final status is seen (cleanup clears the timer).
+		const POLL_INTERVAL_MS = 10000;
+		let poll_timer = null;
+		const schedule_next = () => {
+			if (!settled) poll_timer = setTimeout(tick, POLL_INTERVAL_MS);
+		};
 		let poll_seq = 0;
 		const tick = () => {
 			if (settled) return;
@@ -605,20 +660,20 @@ frappe.pinelabs.register_dialog_extension = function (ext) {
 						finalize(msg.status, `poll#${seq}`, msg.message);
 					}
 				},
+				// Network / server error: keep polling at the same pace.
+				always() {
+					schedule_next();
+				},
 			});
 		};
-		// First poll fires almost immediately to catch any state that
-		// settled in the gap between transaction creation and the
-		// realtime subscription being live.
 		// `enable_poll === false` (set when the wrapper API marks the
 		// response with `_pinelabs_external_poll: true`) skips the entire
 		// internal poll loop; the modal then relies solely on realtime for
-		// state transitions.
-		let poll_interval = null;
+		// state transitions. Realtime events (cron, cancel) still settle the
+		// dialog between polls.
 		if (enable_poll) {
-			setTimeout(tick, 500);
-			poll_interval = setInterval(tick, POLL_INTERVAL_MS);
-			LOG(t(), `polling armed (interval=${POLL_INTERVAL_MS}ms)`);
+			schedule_next();
+			LOG(t(), `polling armed (every ${POLL_INTERVAL_MS}ms, sequential)`);
 		} else {
 			LOG(t(), "polling DISABLED via options.poll=false — realtime is sole state source");
 		}
@@ -626,7 +681,7 @@ frappe.pinelabs.register_dialog_extension = function (ext) {
 		function cleanup() {
 			LOG(t(), "cleanup: detaching realtime + clearing interval");
 			frappe.realtime.off("pinelabs_txn_update", realtime_handler);
-			clearInterval(poll_interval);
+			clearTimeout(poll_timer);
 			modal.$wrapper.off("hide.bs.modal.pinelabs");
 			OPEN_TERMINAL_MODALS.delete(transaction_name);
 			LOG(t(), "cleanup: done");
@@ -635,14 +690,29 @@ frappe.pinelabs.register_dialog_extension = function (ext) {
 		return modal;
 	}
 
+	// Calls on_done(final_status). If the cancel call itself fails, ask the
+	// server for the txn's real status so a paid txn is never reported as
+	// cancelled.
 	function cancel_terminal_payment(transaction_name, on_done) {
+		const done = (status) => on_done && on_done(status);
 		frappe.call({
 			method: "pinelabs_fin.api.terminal.cancel_terminal_payment",
 			args: { transaction_name, reason: "user cancelled from modal" },
 			freeze: true,
 			freeze_message: __("Cancelling..."),
-			always() {
-				if (on_done) on_done();
+			always(r) {
+				const status = r && r.message && r.message.status;
+				if (status) {
+					done(status);
+					return;
+				}
+				frappe.call({
+					method: "pinelabs_fin.api.terminal.poll_terminal_status",
+					args: { transaction_name },
+					always(r2) {
+						done((r2 && r2.message && r2.message.status) || "CANCELLED");
+					},
+				});
 			},
 		});
 	}
@@ -822,7 +892,7 @@ frappe.pinelabs.register_dialog_extension = function (ext) {
 					if (msg.success && typeof txn_name === "string" && PLT_TXN_RE.test(txn_name)) {
 						// Wrapper APIs that run their own poll loop set
 						// `_pinelabs_external_poll: true` on the response —
-						// the modal then skips its internal setInterval and
+						// the modal then skips its internal status poll and
 						// relies solely on the realtime channel for state
 						// transitions. This avoids doubling the rate of
 						// `check_terminal_status` (and therefore the rate of

@@ -22,6 +22,7 @@ per-surface modules under ``api/clients/``.
 
 import hashlib
 import json
+import logging
 import uuid
 from datetime import datetime
 
@@ -31,6 +32,25 @@ from frappe import _
 from frappe.utils import cint, now_datetime
 
 from pinelabs_fin.api.redact import redact
+
+
+def _debug_print(tag, title, data=None):
+	"""DEBUG: print Pine Labs API traffic to the bench console and logs/pinelabs.log.
+
+	Remove (or silence) once the terminal integration is verified.
+	"""
+	if data is not None and not isinstance(data, str):
+		data = json.dumps(data, indent=2, default=str)
+	line = f"[PINELABS {tag}] {now_datetime()} | site={getattr(frappe.local, 'site', None)} | {title}"
+	if data:
+		line += f"\n{data}"
+	print(line, flush=True)
+	try:
+		logger = frappe.logger("pinelabs", allow_site=True)
+		logger.setLevel(logging.INFO)  # Frappe defaults to WARNING/ERROR
+		logger.info(line)
+	except Exception:
+		pass
 
 
 class PineLabsClient:
@@ -316,21 +336,28 @@ class PineLabsClient:
 		"""
 		url, headers = self._prepare_request(endpoint, payload)
 		# Payload carries SecurityToken — mask before it hits the log file.
+		safe_payload = redact(payload)
 		frappe.logger().info(
-			f"Pine Labs API Request to {url}: {json.dumps(redact(payload), indent=2)}"
+			f"Pine Labs API Request to {url}: {json.dumps(safe_payload, indent=2)}"
 		)
+		_debug_print("REQUEST", f"POST {url}", safe_payload)
 
+		started = datetime.now()
 		try:
 			# SSL verification is per-endpoint (defaults to True). UAT
 			# environments with self-signed certs can opt out via the
 			# verify_ssl field on the active Pinelabs API Endpoint row.
 			verify_ssl = getattr(self, "verify_ssl", True)
 			response = requests.post(url, headers=headers, json=payload, timeout=30, verify=verify_ssl)
+			elapsed = (datetime.now() - started).total_seconds()
+			_debug_print("RESPONSE", f"HTTP {response.status_code} in {elapsed:.2f}s from {url}", response.text)
 			return self._parse_response(response)
 		except Exception as e:
+			elapsed = (datetime.now() - started).total_seconds()
+			_debug_print("EXCEPTION", f"{type(e).__name__} after {elapsed:.2f}s calling {url}", repr(e))
 			return self._handle_request_exception(e)
 
-	def _build_transaction_payload(self, transaction_ref, amount, payment_mode):
+	def _build_transaction_payload(self, transaction_ref, amount, payment_mode, allowed_payment_mode=None):
 		"""
 		Build request payload for transaction upload
 
@@ -338,9 +365,13 @@ class PineLabsClient:
 		- Amount in paisa (smallest currency unit for INR) as integer
 		- Example: 159.00 INR = 15900 paisa
 		- SequenceNumber as integer
-		- AllowedPaymentMode: 1=Card, 11=UPI
+		- AllowedPaymentMode: 1=Card, 10=UPI Sale, 11=UPI Bharat QR
+		  (UPI code comes from Pinelabs Settings → UPI Payment Mode Code)
 		"""
-		allowed_payment_mode = 1 if payment_mode == "Card" else 11
+		if not allowed_payment_mode:
+			from pinelabs_fin.api.transaction import get_upi_terminal_code
+
+			allowed_payment_mode = 1 if payment_mode == "Card" else get_upi_terminal_code()
 
 		# Pine Labs API expects amount in paisa (smallest currency unit)
 		# Convert rupees to paisa: multiply by 100
@@ -418,9 +449,11 @@ class PineLabsClient:
 		with ``request_payload`` added so the caller can persist exactly what
 		the app sent to Pine Labs on this transaction's Pinelabs Transaction row.
 		"""
-		# _build_transaction_payload expects "Card" or "UPI" — translate from int code.
+		# Pass the int code through as-is so UPI Sale (10) vs Bharat QR (11) is preserved.
 		mode = "Card" if int(allowed_payment_mode) == 1 else "UPI"
-		payload = self._build_transaction_payload(transaction_ref, amount, mode)
+		payload = self._build_transaction_payload(
+			transaction_ref, amount, mode, allowed_payment_mode=int(allowed_payment_mode)
+		)
 		response = self._make_request(self.upload_endpoint, payload)
 		response["request_payload"] = payload
 		return response

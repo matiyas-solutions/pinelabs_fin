@@ -33,7 +33,7 @@ _MIN_WEBHOOK_SECRET_LEN = 16
 # paid within this many minutes. The field is Optional in the Cloud
 # Integration Guide with no documented min/max; Pine Labs' own examples use
 # 2, 5, 10, 20, 100 and 120. 3 matches the Settings field's description.
-DEFAULT_AUTO_CANCEL_MINUTES = 3
+DEFAULT_AUTO_CANCEL_MINUTES = 5  # validated with Pine Labs
 # Watched fields — when any of these change, the Plural OAuth token cache must
 # be cleared so the next call fetches a fresh token against the new identity.
 _PLURAL_CACHE_BUSTING_FIELDS = (
@@ -266,7 +266,8 @@ def resolve_machine_for_context(
 	  for rows whose ``(mapping_type, reference_name)`` matches a context
 	  extracted from the source document and current session, ordered
 	  alphabetically by machine name; falls back to
-	  ``get_default_machine_config()`` on no match.
+	  ``get_default_machine_config()`` on no match — unless
+	  ``only_mapped_machines`` is ticked, then returns ``None``.
 
 	Returns ``None`` if neither path resolves a machine — caller should error
 	with the standard "no machine configured" message.
@@ -307,6 +308,11 @@ def resolve_machine_for_context(
 				if machine.machine_name == machine_name and cint(machine.enabled):
 					return machine
 
+	# Strict mapping: no matching (enabled) mapping → no machine, so the
+	# caller refuses before Pine Labs is contacted.
+	if cint(settings.get("only_mapped_machines")):
+		return None
+
 	return get_default_machine_config()
 
 
@@ -341,7 +347,8 @@ def _extract_routing_contexts(source_doc):
 	if company:
 		contexts.append(("Company", company))
 
-	pos_profile = _get("pos_profile")
+	# POS Awesome payments reference the POS Profile itself.
+	pos_profile = source_doc.name if _get("doctype") == "POS Profile" else _get("pos_profile")
 	if pos_profile:
 		contexts.append(("POS Profile", pos_profile))
 

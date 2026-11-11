@@ -118,12 +118,40 @@ def assert_can_pay(reference_doctype, reference_name, source_doc=None):
 	Administrator and the cron/webhook contexts (which run as Administrator)
 	bypass this the same way they bypass every other Frappe permission check.
 	"""
+	if reference_doctype == "POS Profile":
+		assert_pos_profile_cashier(reference_name)
+		return
 	frappe.has_permission(
 		doctype=reference_doctype,
 		ptype="write",
 		doc=source_doc or reference_name,
 		throw=True,
 	)
+
+
+def assert_pos_profile_cashier(pos_profile):
+	"""POS Awesome payments reference the POS Profile — the invoice doesn't
+	exist until the payment succeeds (see api/posawesome.py). Cashiers rarely
+	have write on POS Profile, so the bar there is: assigned to this profile
+	(POS Profile → Applicable for Users) and allowed to create an invoice.
+	Users with write on the profile (Accounts Manager etc.) also pass.
+	"""
+	if frappe.session.user == "Administrator" or frappe.has_permission(
+		"POS Profile", ptype="write", doc=pos_profile
+	):
+		return
+	assigned = frappe.db.exists(
+		"POS Profile User",
+		{"parent": pos_profile, "parenttype": "POS Profile", "user": frappe.session.user},
+	)
+	can_invoice = frappe.has_permission("Sales Invoice", ptype="create") or frappe.has_permission(
+		"POS Invoice", ptype="create"
+	)
+	if not (assigned and can_invoice):
+		frappe.throw(
+			_("You are not a cashier on POS Profile {0}.").format(pos_profile),
+			frappe.PermissionError,
+		)
 
 
 def assert_initiate_allowed(reference_doctype, reference_name, *, flow, source_doc=None):
