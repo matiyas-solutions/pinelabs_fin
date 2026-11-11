@@ -393,7 +393,7 @@ frappe.pinelabs.register_dialog_extension = function (ext) {
 		const on_settled = (...args) => call_all(settled_listeners, args);
 		const on_cancel = (...args) => call_all(cancel_listeners, args);
 		const show_alert = options.show_alert !== false;
-		// `poll: false` opts out of the modal's internal 3s setInterval poll.
+		// `poll: false` opts out of the modal's internal 10s status poll.
 		// Useful when a wrapper API (e.g. fin_pos) already runs its own poll
 		// against `check_terminal_status` — without this, both pollers hit
 		// Pine Labs in parallel, doubling the gateway API rate. The modal
@@ -622,13 +622,15 @@ frappe.pinelabs.register_dialog_extension = function (ext) {
 		frappe.realtime.on("pinelabs_txn_update", realtime_handler);
 		LOG(t(), "realtime subscribed to pinelabs_txn_update");
 
-		// Fixed-interval poll using setInterval — fires every 3s regardless
-		// of whether the previous response is back. This matches the old
-		// fast-feedback pattern: chained setTimeout was effectively
-		// (round-trip + 2s) per cycle, which stretched out the perceived
-		// lag once the terminal finished. check_terminal_status is
-		// idempotent, so overlapping in-flight requests are safe.
-		const POLL_INTERVAL_MS = 3000;
+		// Status poll every 10s, one request at a time (as validated with
+		// Pine Labs): the next poll is scheduled only after the previous
+		// response arrives, so slow gateway replies never overlap. The loop
+		// stops as soon as a final status is seen (cleanup clears the timer).
+		const POLL_INTERVAL_MS = 10000;
+		let poll_timer = null;
+		const schedule_next = () => {
+			if (!settled) poll_timer = setTimeout(tick, POLL_INTERVAL_MS);
+		};
 		let poll_seq = 0;
 		const tick = () => {
 			if (settled) return;
@@ -658,20 +660,20 @@ frappe.pinelabs.register_dialog_extension = function (ext) {
 						finalize(msg.status, `poll#${seq}`, msg.message);
 					}
 				},
+				// Network / server error: keep polling at the same pace.
+				always() {
+					schedule_next();
+				},
 			});
 		};
-		// First poll fires almost immediately to catch any state that
-		// settled in the gap between transaction creation and the
-		// realtime subscription being live.
 		// `enable_poll === false` (set when the wrapper API marks the
 		// response with `_pinelabs_external_poll: true`) skips the entire
 		// internal poll loop; the modal then relies solely on realtime for
-		// state transitions.
-		let poll_interval = null;
+		// state transitions. Realtime events (cron, cancel) still settle the
+		// dialog between polls.
 		if (enable_poll) {
-			setTimeout(tick, 500);
-			poll_interval = setInterval(tick, POLL_INTERVAL_MS);
-			LOG(t(), `polling armed (interval=${POLL_INTERVAL_MS}ms)`);
+			schedule_next();
+			LOG(t(), `polling armed (every ${POLL_INTERVAL_MS}ms, sequential)`);
 		} else {
 			LOG(t(), "polling DISABLED via options.poll=false — realtime is sole state source");
 		}
@@ -679,7 +681,7 @@ frappe.pinelabs.register_dialog_extension = function (ext) {
 		function cleanup() {
 			LOG(t(), "cleanup: detaching realtime + clearing interval");
 			frappe.realtime.off("pinelabs_txn_update", realtime_handler);
-			clearInterval(poll_interval);
+			clearTimeout(poll_timer);
 			modal.$wrapper.off("hide.bs.modal.pinelabs");
 			OPEN_TERMINAL_MODALS.delete(transaction_name);
 			LOG(t(), "cleanup: done");
@@ -890,7 +892,7 @@ frappe.pinelabs.register_dialog_extension = function (ext) {
 					if (msg.success && typeof txn_name === "string" && PLT_TXN_RE.test(txn_name)) {
 						// Wrapper APIs that run their own poll loop set
 						// `_pinelabs_external_poll: true` on the response —
-						// the modal then skips its internal setInterval and
+						// the modal then skips its internal status poll and
 						// relies solely on the realtime channel for state
 						// transitions. This avoids doubling the rate of
 						// `check_terminal_status` (and therefore the rate of

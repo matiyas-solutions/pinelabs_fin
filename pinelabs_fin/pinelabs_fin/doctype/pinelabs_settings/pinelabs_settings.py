@@ -33,7 +33,7 @@ _MIN_WEBHOOK_SECRET_LEN = 16
 # paid within this many minutes. The field is Optional in the Cloud
 # Integration Guide with no documented min/max; Pine Labs' own examples use
 # 2, 5, 10, 20, 100 and 120. 3 matches the Settings field's description.
-DEFAULT_AUTO_CANCEL_MINUTES = 3
+DEFAULT_AUTO_CANCEL_MINUTES = 5  # validated with Pine Labs
 # Watched fields — when any of these change, the Plural OAuth token cache must
 # be cleared so the next call fetches a fresh token against the new identity.
 _PLURAL_CACHE_BUSTING_FIELDS = (

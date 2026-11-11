@@ -48,6 +48,9 @@ from pinelabs_fin.api.pinelabs_client import _debug_print
 # gateway-side cancellation before deciding to force one itself.
 AGE_OUT_GRACE_MINUTES = 2
 
+# Validated with Pine Labs: no terminal transaction below ₹1.
+MIN_TERMINAL_AMOUNT = 1
+
 
 @frappe.whitelist()
 def initiate_terminal_payment(
@@ -105,6 +108,14 @@ def initiate_terminal_payment(
 	resolved_amount = flt(amount) if amount else _amount_for(source_doc)
 	if resolved_amount <= 0:
 		frappe.throw(_("No outstanding amount on {0} {1}.").format(reference_doctype, reference_name))
+	if resolved_amount < MIN_TERMINAL_AMOUNT:
+		# Validated with Pine Labs: the billing app never initiates below ₹1.
+		frappe.throw(
+			_("Pine Labs terminal payments must be at least ₹{0}. Amount: ₹{1}.").format(
+				MIN_TERMINAL_AMOUNT, resolved_amount
+			),
+			title=_("Amount Too Low"),
+		)
 
 	# Serialize concurrent initiates on this source doc, then refuse a second
 	# attempt while one is in flight. The lock closes the check-then-act window

@@ -172,7 +172,7 @@
    "options": "Pinelabs API Endpoints"
   },
   {
-   "description": "Auto-cancel pending transactions after this many minutes. Default 3 if 0/empty.",
+   "description": "Auto-cancel pending transactions after this many minutes. Default 5 if 0/empty.",
    "fieldname": "auto_cancel_duration_minutes",
    "fieldtype": "Int",
    "label": "Auto Cancel Duration (Minutes)"
